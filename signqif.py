@@ -288,8 +288,11 @@ def save_signed_document(tree: _ElementTree, original_filename: str) -> str:
     
     file_name = original_filename[:type_loc] + '-signed' + original_filename[type_loc:]
     
+    # Apply pretty printing to the entire document
+    etree.indent(tree, space="  ")
+    
     with open(file_name, 'wb') as f:
-        tree.write(f, encoding='utf-8', xml_declaration=True)
+        tree.write(f, encoding='utf-8', xml_declaration=True, pretty_print=True)
     
     logging.info(f'Signed QIF document written to file {file_name}')
     return file_name
