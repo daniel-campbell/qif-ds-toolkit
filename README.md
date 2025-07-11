@@ -71,6 +71,7 @@ xmlsec --verify --trusted-pem cert.cer input-signed.QIF
 | `-cert CERT` | Yes | x509 certificate file in PEM format |
 | `-keypass KEYPASS` | No | Password for private key (if password-protected) |
 | `-v` | No | Enable verbose output for detailed logging |
+| `--pretty-print` | No | Format output XML with indentation for readability |
 | `-h, --help` | No | Show help message and exit |
 
 ### Examples
@@ -90,9 +91,19 @@ python signqif.py -key private.pem -keypass mypassword -cert certificate.cer doc
 python signqif.py -v -key private.pem -cert certificate.cer document.QIF
 ```
 
+**With pretty-printed output:**
+```bash
+python signqif.py --pretty-print -key private.pem -cert certificate.cer document.QIF
+```
+
 ## Output
 
 The tool creates a new QIF file with "-signed" appended to the original filename. For example, `document.QIF` becomes `document-signed.QIF`.
+
+### Formatting Options
+
+- **Default**: Output has newlines between elements but zero indentation (each element starts at column 0)
+- **With `--pretty-print`**: Output is formatted with consistent indentation (2 spaces) for improved readability
 
 ## Features
 

@@ -70,6 +70,11 @@ def parse_arguments() -> argparse.Namespace:
         help='Verbose', 
         action='store_true'
     )
+    parser.add_argument(
+        '--pretty-print',
+        help='Format output XML with indentation for readability',
+        action='store_true'
+    )
     return parser.parse_args()
 
 
@@ -280,7 +285,7 @@ def verify_signature(public_key: Union[rsa.RSAPublicKey, ec.EllipticCurvePublicK
                         'possible mismatch between private key and certificate')
 
 
-def save_signed_document(tree: _ElementTree, original_filename: str) -> str:
+def save_signed_document(tree: _ElementTree, original_filename: str, pretty_print: bool = False) -> str:
     """Save the signed QIF document with '-signed' appended to filename."""
     type_loc = original_filename.rfind('.')
     if type_loc == -1:
@@ -288,13 +293,29 @@ def save_signed_document(tree: _ElementTree, original_filename: str) -> str:
     
     file_name = original_filename[:type_loc] + '-signed' + original_filename[type_loc:]
     
-    # Apply pretty printing to the entire document
-    etree.indent(tree, space="  ")
+    # Remove all existing whitespace formatting from the entire document
+    # Note: cleanup_namespaces is deprecated but still functional for this use case
     
-    with open(file_name, 'wb') as f:
-        tree.write(f, encoding='utf-8', xml_declaration=True, pretty_print=True)
+    # Strip whitespace from all elements to ensure consistent formatting
+    for elem in tree.iter():
+        if elem.text:
+            elem.text = elem.text.strip() or None
+        if elem.tail:
+            elem.tail = elem.tail.strip() or None
     
-    logging.info(f'Signed QIF document written to file {file_name}')
+    if pretty_print:
+        # Apply pretty printing with indentation to entire document
+        etree.indent(tree, space="  ")
+        with open(file_name, 'wb') as f:
+            tree.write(f, encoding='utf-8', xml_declaration=True, pretty_print=True)
+        logging.info(f'Signed QIF document written to file {file_name} (pretty-printed)')
+    else:
+        # Apply newlines but zero indentation - each element starts at column 0
+        etree.indent(tree, space="")
+        with open(file_name, 'wb') as f:
+            tree.write(f, encoding='utf-8', xml_declaration=True)
+        logging.info(f'Signed QIF document written to file {file_name} (newlines, no indentation)')
+    
     return file_name
 
 
@@ -330,7 +351,7 @@ def main():
     qif_root.append(signature)
     
     # Save signed document
-    save_signed_document(tree, args.qifFile.name)
+    save_signed_document(tree, args.qifFile.name, getattr(args, 'pretty_print', False))
 
 
 if __name__ == "__main__":
