@@ -6,7 +6,7 @@ Toolkit for applying XML digital signatures to QIF (Quality Information Framewor
 
 - Python 3.7 or higher
 - OpenSSL (for certificate generation)
-- xmlsec (optional, for signature verification)
+- xmlsec1 (optional, for signature verification)
 
 ### Python Dependencies
 
@@ -57,9 +57,9 @@ python signqif.py -key key.pem -keypass yourpassword -cert cert.cer input.QIF
 
 ### Verify Signature
 
-Verify the signed document (requires xmlsec):
+Verify the signed document (requires xmlsec1):
 ```bash
-xmlsec --verify --trusted-pem cert.cer input-signed.QIF
+xmlsec1 --verify --trusted-pem cert.cer input-signed.QIF
 ```
 
 ## Command Line Options

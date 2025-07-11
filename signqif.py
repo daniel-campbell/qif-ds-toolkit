@@ -293,28 +293,13 @@ def save_signed_document(tree: _ElementTree, original_filename: str, pretty_prin
     
     file_name = original_filename[:type_loc] + '-signed' + original_filename[type_loc:]
     
-    # Remove all existing whitespace formatting from the entire document
-    # Note: cleanup_namespaces is deprecated but still functional for this use case
+    # Formatting has already been applied before signature computation
+    # Just save the document as-is to preserve signature validity
+    with open(file_name, 'wb') as f:
+        tree.write(f, encoding='utf-8', xml_declaration=True)
     
-    # Strip whitespace from all elements to ensure consistent formatting
-    for elem in tree.iter():
-        if elem.text:
-            elem.text = elem.text.strip() or None
-        if elem.tail:
-            elem.tail = elem.tail.strip() or None
-    
-    if pretty_print:
-        # Apply pretty printing with indentation to entire document
-        etree.indent(tree, space="  ")
-        with open(file_name, 'wb') as f:
-            tree.write(f, encoding='utf-8', xml_declaration=True, pretty_print=True)
-        logging.info(f'Signed QIF document written to file {file_name} (pretty-printed)')
-    else:
-        # Apply newlines but zero indentation - each element starts at column 0
-        etree.indent(tree, space="")
-        with open(file_name, 'wb') as f:
-            tree.write(f, encoding='utf-8', xml_declaration=True)
-        logging.info(f'Signed QIF document written to file {file_name} (newlines, no indentation)')
+    format_type = "pretty-printed" if pretty_print else "formatted with newlines, no indentation"
+    logging.info(f'Signed QIF document written to file {file_name} ({format_type})')
     
     return file_name
 
@@ -326,6 +311,25 @@ def main():
     
     # Load QIF Document
     tree = load_qif_document(args.qifFile)
+    
+    # Apply user's desired formatting BEFORE computing signature to ensure verification works
+    pretty_print_flag = getattr(args, 'pretty_print', False)
+    if pretty_print_flag:
+        # Strip all whitespace and apply pretty printing
+        for elem in tree.iter():
+            if elem.text:
+                elem.text = elem.text.strip() or None
+            if elem.tail:
+                elem.tail = elem.tail.strip() or None
+        etree.indent(tree, space="  ")
+    else:
+        # Strip whitespace and apply newlines with zero indentation
+        for elem in tree.iter():
+            if elem.text:
+                elem.text = elem.text.strip() or None
+            if elem.tail:
+                elem.tail = elem.tail.strip() or None
+        etree.indent(tree, space="")
     
     # Load Certificate
     cert, public_key, sign_algorithm, sign_method = load_certificate(args.cert)
