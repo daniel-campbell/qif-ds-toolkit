@@ -383,6 +383,15 @@ def add_key_info(signature: _Element, cert: x509.Certificate) -> None:
     x509_cert.text = base64.b64encode(cert.public_bytes(serialization.Encoding.DER))
 
 
+def ecdsa_raw_to_der(sig_val: bytes) -> bytes:
+    """Convert an XML Signature ECDSA value (raw r || s) to the DER form cryptography expects."""
+    size = len(sig_val) // 2
+    return encode_dss_signature(
+        int.from_bytes(sig_val[:size], 'big'),
+        int.from_bytes(sig_val[size:], 'big')
+    )
+
+
 def verify_signature(public_key: Union[rsa.RSAPublicKey, ec.EllipticCurvePublicKey], sig_val: bytes, signed_info: _Element, sign_method: str) -> None:
     """Verify that the public key can validate the signature value."""
     sign_info_c14n = etree.tostring(signed_info, method="c14n", with_comments=False, exclusive=True)
@@ -398,14 +407,8 @@ def verify_signature(public_key: Union[rsa.RSAPublicKey, ec.EllipticCurvePublicK
             )
         else:  # assumed to be ecdsa, no padding argument
             ec_pub_key = cast(ec.EllipticCurvePublicKey, public_key)
-            # Convert raw r || s back to DER for cryptography
-            size = len(sig_val) // 2
-            der_sig = encode_dss_signature(
-                int.from_bytes(sig_val[:size], 'big'),
-                int.from_bytes(sig_val[size:], 'big')
-            )
             ec_pub_key.verify(
-                der_sig,
+                ecdsa_raw_to_der(sig_val),
                 sign_info_c14n,
                 ec.ECDSA(hashes.SHA256())
             )

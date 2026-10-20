@@ -1,0 +1,2 @@
+lxml>=4.9
+cryptography>=42

@@ -1,63 +1,98 @@
 # QIF Digital Signature Toolkit
 
-Toolkit for applying XML digital signatures to QIF (Quality Information Framework) documents.
+Tools for signing QIF (Quality Information Framework) documents with XML digital signatures, and for verifying those signatures.
+
+- `signqif.py` signs a QIF document, and any external QIF documents it references, embedding the signature and signer certificate in the document.
+- `verifyqif.py` checks that a signed QIF document, and any external QIF documents it references, have not changed since signing, and shows who signed it.
+- `make_test_cert.py` creates a private key and self-signed certificate for trying out the tools.
+
+The tools follow the W3C XML Signature standard and support RSA and ECDSA keys. They run on Windows, macOS and Linux.
 
 ## Requirements
 
 - Python 3.11 or higher
-- OpenSSL (for certificate generation)
-- xmlsec1 (optional, for signature verification)
-
-### Python Dependencies
-
-- `lxml` - XML processing library
-- `cryptography` - Cryptographic operations
-
-## Overview
-
-This toolkit creates XML digital signatures for QIF documents and any external QIF documents they reference. It supports RSA and ECDSA cryptographic methods and embeds the signature and certificate into the QIF document according to XML digital signature standards.
+- Python packages `lxml` (XML processing) and `cryptography` (cryptographic operations), listed in `requirements.txt`
 
 ## Installation
 
-Create a virtual environment and install dependencies:
+Create a virtual environment and install the dependencies.
 
+macOS and Linux:
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install lxml cryptography
+pip install -r requirements.txt
 ```
 
-## Usage
+Windows (PowerShell):
+```powershell
+python -m venv venv
+venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
 
-### Generate Test Certificate and Key
+Activate the virtual environment again in each new terminal before running the tools.
 
-Create a self-signed certificate for testing:
+## Quick Start
 
 ```bash
-openssl req -x509 -newkey rsa:2048 -noenc -keyout key.pem -out cert.cer
+python make_test_cert.py
+python signqif.py -key key.pem -cert cert.cer samples/nist_ctc_01_asme1_ap242.qif
+python verifyqif.py samples/nist_ctc_01_asme1_ap242-signed.qif
 ```
 
-`-noenc` requires OpenSSL 3.0 or later; older versions use `-nodes`.
+## Creating a Test Key and Certificate
 
-### Sign a QIF Document
-
-Basic usage:
 ```bash
-source venv/bin/activate
-python signqif.py -key key.pem -cert cert.cer input.QIF
+python make_test_cert.py
 ```
 
-With verbose output:
+This creates an RSA private key `key.pem` and a self-signed certificate `cert.cer` in the current directory. A self-signed certificate does not prove who signed a document; for production, use a certificate issued by a certificate authority your recipients trust.
+
+| Option | Description |
+|--------|-------------|
+| `-key KEY` | Private key file to create, default `key.pem` |
+| `-cert CERT` | Certificate file to create, default `cert.cer` |
+| `--ecdsa` | Create an ECDSA P-256 key instead of RSA 2048 |
+| `--encrypt` | Protect the private key with a password, which you are prompted for |
+| `--name NAME` | Common name in the certificate, default `QIF Test Signer` |
+| `--days DAYS` | Days the certificate is valid, default 365 |
+
+Existing files are never overwritten. If you have OpenSSL, `openssl req -x509 -newkey rsa:2048 -noenc -keyout key.pem -out cert.cer` creates an equivalent pair.
+
+## Signing a QIF Document
+
 ```bash
-python signqif.py -v -key key.pem -cert cert.cer input.QIF
+python signqif.py -key key.pem -cert cert.cer document.QIF
 ```
+
+The signed document is written next to the input with `-signed` added to its name, so `document.QIF` becomes `document-signed.QIF`. Any existing signature in the input is replaced.
+
+| Option | Required | Description |
+|--------|----------|-------------|
+| `qifFile` | Yes | QIF file to be signed |
+| `-key KEY` | Yes | Private key file in PEM format |
+| `-cert CERT` | Yes | x509 certificate file in PEM format, matching the private key |
+| `--pretty-print` | No | Indent the output XML for readability |
+| `-v` | No | Verbose output |
+
+### Formatting
+
+- **Default**: newlines between elements, no indentation
+- **With `--pretty-print`**: indented with 2 spaces per level, including the signature
+
+Either way, only whitespace between elements is changed; element values are written exactly as they appear in the input.
+
+### External QIF Documents
+
+If the document lists external QIF documents with a `URI`, each one is signed as well, so verification fails if any of them changes. Relative URIs are resolved against the signed document's location, as the XML Signature standard requires. Local files only: relative paths, absolute paths and `file:` URIs.
 
 ### Password-Protected Keys
 
 If the private key is encrypted, the tool prompts for its password when it runs. The password is not shown as you type, and you get three attempts.
 
 ```
-$ python signqif.py -key key.pem -cert cert.cer input.QIF
+$ python signqif.py -key key.pem -cert cert.cer document.QIF
 Password for key.pem:
 ```
 
@@ -65,109 +100,82 @@ For unattended signing, such as in a CI pipeline, set the `QIF_KEY_PASSWORD` env
 
 Passwords cannot be given on the command line, where they would be visible to other users and saved in shell history.
 
-### Verify Signature
+## Verifying a Signed QIF Document
 
-Verify the signed document (requires xmlsec1):
 ```bash
-xmlsec1 --verify --trusted-pem cert.cer input-signed.QIF
+python verifyqif.py document-signed.QIF
 ```
 
-If the document references external QIF documents, run `xmlsec1` from the signed document's directory. The signer resolves relative external URIs against the signed document's location, as the XML Signature specification requires, but `xmlsec1` resolves them against the current working directory.
+```
+Reference this document: OK
+Signature: OK
+Signed with certificate:
+  Subject:     CN=QIF Test Signer
+  Issuer:      CN=QIF Test Signer
+  Valid:       2026-10-20 to 2027-10-20
+  Fingerprint: SHA256 F6:9D:B0:B3:...
+  Checked against the certificate embedded in the file. This shows the document has not changed since it was signed, not who signed it. Use -cert to require a certificate you trust.
+Result: VALID
+```
 
-## Command Line Options
+The tool exits with status 0 if the signature is valid and 1 if it is not, so it can be used in scripts.
 
 | Option | Required | Description |
 |--------|----------|-------------|
-| `qifFile` | Yes | QIF file to be signed (positional argument) |
-| `-key KEY` | Yes | Private key file in PEM format |
-| `-cert CERT` | Yes | x509 certificate file in PEM format |
-| `-v` | No | Enable verbose output for detailed logging |
-| `--pretty-print` | No | Format output XML with indentation for readability |
-| `-h, --help` | No | Show help message and exit |
+| `qifFile` | Yes | Signed QIF file to be verified |
+| `-cert CERT` | No | x509 certificate in PEM format that the document must be signed with |
+| `-v` | No | Verbose output |
 
-### Examples
+### Who Signed It
 
-**Basic signing:**
+Without `-cert`, the signature is checked against the certificate embedded in the document. That proves the document has not changed since it was signed, but anyone can embed their own certificate, so it does not prove who signed it. To require a specific signer, give the certificate you trust:
+
 ```bash
-python signqif.py -key private.pem -cert certificate.cer document.QIF
+python verifyqif.py -cert trusted.cer document-signed.QIF
 ```
 
-**With verbose logging:**
+### Other Signers and Tools
+
+`verifyqif.py` also verifies QIF documents signed by other XML Signature tools, provided they use whole-document references with the common algorithms: RSA or ECDSA with SHA-256, SHA-384 or SHA-512, and inclusive or exclusive XML canonicalization.
+
+Documents signed by `signqif.py` can also be verified with other tools, such as `xmlsec1 --verify --trusted-pem cert.cer document-signed.QIF`. If the document references external QIF documents, run `xmlsec1` from the signed document's directory, because `xmlsec1` resolves relative URIs against the current directory rather than the document's location.
+
+## Running the Tests
+
+From the repository directory, with the virtual environment active:
+
 ```bash
-python signqif.py -v -key private.pem -cert certificate.cer document.QIF
+python -m unittest
 ```
 
-**With pretty-printed output:**
-```bash
-python signqif.py --pretty-print -key private.pem -cert certificate.cer document.QIF
-```
-
-## Output
-
-The tool creates a new QIF file with "-signed" appended to the original filename. For example, `document.QIF` becomes `document-signed.QIF`.
-
-### Formatting Options
-
-- **Default**: Output has newlines between elements but zero indentation (each element starts at column 0)
-- **With `--pretty-print`**: Output is formatted with consistent indentation (2 spaces) for improved readability
-
-Either way, only whitespace between elements is changed; element values are written exactly as they appear in the input.
-
-## Features
-
-- Supports RSA and ECDSA cryptographic methods
-- Creates digest values for main document and external references
-- Removes existing signatures before signing
-- Validates signature with public key before output
-- Comprehensive logging with verbose mode
+The tests sign the sample document with RSA and ECDSA keys, and check that verification succeeds, and that it fails when the document, an external document or the expected certificate changes.
 
 ## Security Considerations
 
-⚠️ **Important Security Notes:**
-
-- **Private Key Protection**: Keep your private keys secure and never commit them to version control
-- **Certificate Validation**: Ensure certificates are from trusted sources in production environments
-- **Key Strength**: Use at least 2048-bit RSA keys or equivalent ECDSA key strength
-- **Password Security**: Use strong passwords for password-protected keys
-- **Signature Verification**: Always verify signatures using trusted certificates before accepting signed documents
-
-### Recommended Practices
-
-1. **Generate keys securely**: Use proper entropy sources when generating cryptographic keys
-2. **Store keys safely**: Use hardware security modules (HSMs) or secure key storage for production
-3. **Regular rotation**: Rotate signing keys according to your security policy
-4. **Audit trail**: Maintain logs of signing operations for security auditing
+- **Private key protection**: keep private keys secure, protect production keys with a password, and never commit them to version control
+- **Certificates**: use certificates from a certificate authority your recipients trust in production; self-signed certificates are for testing
+- **Key strength**: use at least 2048-bit RSA keys or equivalent ECDSA keys
+- **Passwords**: use strong passwords for password-protected keys
+- **Verification**: verify with `-cert` and a certificate you trust before relying on who signed a document
 
 ## Troubleshooting
 
-### Common Issues
-
 **"Unable to parse XML from QIF file"**
-- Ensure the input file is valid XML
-- Check file permissions and encoding
-- Verify the file is not corrupted
+- The input file must be well-formed XML; the message includes the parser's error and line number
 
 **"QIF file does not contain QIFDocument as its root element"**
-- The input file must be a valid QIF document
-- Check that the root element has the correct namespace: `http://qifstandards.org/xsd/qif3`
+- The input file must be a QIF document with root element `QIFDocument` in the namespace `http://qifstandards.org/xsd/qif3`
+
+**"Private key does not contain a recognized cryptosystem or does not match certificate cryptosystem"**
+- Only RSA and ECDSA keys in PEM format are supported, and the key and certificate must be the same type
 
 **"Unable to validate signature with public key"**
-- Ensure the private key matches the certificate
-- Check that the private key is not corrupted
-- Verify the certificate is valid and not expired
+- The private key does not match the certificate
 
-**"Private key does not contain a recognized cryptosystem"**
-- Only RSA and ECDSA keys are supported
-- Ensure the private key file is in PEM format
-- Check that the key was generated correctly
+**"Reference ... FAILED" when verifying**
+- The named document has changed since it was signed, or an external document could not be found next to the signed document
 
-### Getting Help
-
-If you encounter issues:
-1. Run with `-v` flag for verbose output
-2. Check that all dependencies are properly installed
-3. Verify file permissions and paths
-4. Ensure OpenSSL is available for certificate operations
+Run either tool with `-v` for more detail.
 
 ## License
 
