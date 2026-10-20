@@ -54,7 +54,7 @@ python signqif.py -v -key key.pem -cert cert.cer input.QIF
 
 ### Password-Protected Keys
 
-If the private key is encrypted, the tool prompts for its password when it runs. The password is not shown as you type.
+If the private key is encrypted, the tool prompts for its password when it runs. The password is not shown as you type, and you get three attempts.
 
 ```
 $ python signqif.py -key key.pem -cert cert.cer input.QIF

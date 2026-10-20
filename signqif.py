@@ -25,7 +25,7 @@ import hashlib
 import logging
 import os
 import sys
-from typing import Tuple, Union, cast
+from typing import Optional, Tuple, Union, cast
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
@@ -33,12 +33,16 @@ from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding
+from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
 from lxml import etree
 from lxml.etree import _Element, _ElementTree
 
 # Environment variable holding the private key password, for unattended signing
 KEY_PASSWORD_ENV = 'QIF_KEY_PASSWORD'
+
+# Password prompts allowed before giving up
+PASSWORD_ATTEMPTS = 3
 
 
 def setup_logging(verbose: bool) -> None:
@@ -161,30 +165,54 @@ def can_prompt() -> bool:
     return True
 
 
-def get_key_password(key_name: str) -> bytes:
-    """Get the password for an encrypted private key from the environment, or prompt for it."""
-    password = os.environ.get(KEY_PASSWORD_ENV)
-    if not password:
-        if not can_prompt():
-            raise SystemExit(f'Private key is encrypted. Run interactively to be prompted for the password, '
-                             f'or set the {KEY_PASSWORD_ENV} environment variable.')
-        try:
-            password = getpass.getpass(f'Password for {key_name}: ')
-        except (KeyboardInterrupt, EOFError):
-            raise SystemExit('Cancelled.')
-    return password.encode('utf-8')
+def prompt_password(key_name: str) -> str:
+    """Prompt for a private key password without echoing it."""
+    try:
+        return getpass.getpass(f'Password for {key_name}: ')
+    except (KeyboardInterrupt, EOFError):
+        raise SystemExit('Cancelled.')
+
+
+def decrypt_private_key(key_data: bytes, password: str) -> Optional[PrivateKeyTypes]:
+    """Return the decrypted private key, or None if the password is incorrect."""
+    try:
+        return serialization.load_pem_private_key(key_data, password=password.encode('utf-8'))
+    except (ValueError, TypeError):  # Key is known to be encrypted, so failing to decrypt (or an empty password) means a wrong password
+        return None
+    except UnsupportedAlgorithm as e:
+        raise SystemExit(f'Unable to load private key: {e}')
+
+
+def load_encrypted_private_key(key_data: bytes, key_name: str) -> PrivateKeyTypes:
+    """Load an encrypted private key using the password from the environment, or by prompting for it."""
+    env_password = os.environ.get(KEY_PASSWORD_ENV)
+    if env_password:
+        private_key = decrypt_private_key(key_data, env_password)
+        if private_key is None:
+            raise SystemExit(f'Incorrect password for {key_name} in the {KEY_PASSWORD_ENV} environment variable.')
+        return private_key
+    
+    if not can_prompt():
+        raise SystemExit(f'Private key is encrypted. Run interactively to be prompted for the password, '
+                         f'or set the {KEY_PASSWORD_ENV} environment variable.')
+    for attempt in range(PASSWORD_ATTEMPTS):
+        if attempt > 0:
+            print('Incorrect password, try again.', file=sys.stderr)
+        private_key = decrypt_private_key(key_data, prompt_password(key_name))
+        if private_key is not None:
+            return private_key
+    raise SystemExit(f'Incorrect password for {key_name}.')
 
 
 def load_private_key(key_file, sign_method: str) -> Union[rsa.RSAPrivateKey, ec.EllipticCurvePrivateKey]:
     """Load and validate private key."""
     key_data = key_file.read()
     try:
-        try:
-            private_key = serialization.load_pem_private_key(key_data, password=None)
-        except TypeError:  # Key is encrypted, the password is only requested when needed
-            private_key = serialization.load_pem_private_key(key_data, password=get_key_password(key_file.name))
-    except (ValueError, UnsupportedAlgorithm) as e:  # Not PEM, incorrect password, or unsupported key type
-        raise SystemExit(f'Unable to load private key, PEM format and correct password are required: {e}')
+        private_key = serialization.load_pem_private_key(key_data, password=None)
+    except TypeError:  # Key is encrypted, the password is only requested when needed
+        private_key = load_encrypted_private_key(key_data, key_file.name)
+    except (ValueError, UnsupportedAlgorithm) as e:  # Not PEM, or unsupported key type
+        raise SystemExit(f'Unable to load private key, PEM format is required: {e}')
     
     if isinstance(private_key, rsa.RSAPrivateKey) and sign_method == 'rsa':
         logging.info('RSA cryptosystem detected in private key.')
