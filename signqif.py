@@ -14,22 +14,31 @@ Usage examples:
     python signqif.py -v -key 'key.pem' -cert 'cert.cer' 'Exploded_Results1.QIF'
     
     # Validate the signature
-    xmlsec --verify --trusted-pem cert.cer Exploded_Results1-signed.QIF
+    xmlsec1 --verify --trusted-pem cert.cer Exploded_Results1-signed.QIF
 """
 
 import argparse
 import base64
 import copy
+import getpass
 import hashlib
 import logging
-from typing import Optional, Tuple, Union, cast
+import os
+import sys
+from typing import Tuple, Union, cast
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from cryptography import x509
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
 from lxml import etree
 from lxml.etree import _Element, _ElementTree
+
+# Environment variable holding the private key password, for unattended signing
+KEY_PASSWORD_ENV = 'QIF_KEY_PASSWORD'
 
 
 def setup_logging(verbose: bool) -> None:
@@ -46,9 +55,8 @@ def parse_arguments() -> argparse.Namespace:
                    'Document using input file and external QIF documents as references.'
     )
     parser.add_argument(
-        'qifFile', 
-        help='QIF file to be signed', 
-        type=argparse.FileType('r', encoding='UTF-8')
+        'qifFile',
+        help='QIF file to be signed'
     )
     parser.add_argument(
         '-key', 
@@ -57,8 +65,8 @@ def parse_arguments() -> argparse.Namespace:
         required=True
     )
     parser.add_argument(
-        '-keypass', 
-        help='Password for private key'
+        '-keypass',
+        help=argparse.SUPPRESS  # Removed, kept only to explain the removal
     )
     parser.add_argument(
         '-cert', 
@@ -76,15 +84,28 @@ def parse_arguments() -> argparse.Namespace:
         help='Format output XML with indentation for readability',
         action='store_true'
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.keypass is not None:
+        parser.error(f'-keypass has been removed because passwords on the command line are visible to other '
+                     f'users and saved in shell history. You will be prompted for the password, or set the '
+                     f'{KEY_PASSWORD_ENV} environment variable for unattended signing.')
+    return args
 
 
-def load_qif_document(qif_file) -> _ElementTree:
+def load_qif_document(qif_path: str) -> _ElementTree:
     """Load and validate QIF document."""
+    # libxml2 treats '-' as standard input, unsupported since the output file name and
+    # external reference locations are derived from the input path
+    if qif_path == '-':
+        raise SystemExit('Reading the QIF file from standard input is not supported, give a file path.')
+    
+    # Parsed from the file so the XML declaration determines the encoding
     try:
-        tree = etree.parse(qif_file, parser=etree.XMLParser())
-    except Exception:
-        raise SystemExit('Unable to parse XML from QIF file.')
+        tree = etree.parse(qif_path, parser=etree.XMLParser())
+    except etree.XMLSyntaxError as e:
+        raise SystemExit(f'Unable to parse XML from QIF file: {e}')
+    except OSError as e:
+        raise SystemExit(f'Unable to read QIF file: {e}')
     
     # Confirm document is a QIF Document
     qif_root = tree.getroot()
@@ -105,7 +126,10 @@ def load_qif_document(qif_file) -> _ElementTree:
 
 def load_certificate(cert_file) -> Tuple[x509.Certificate, Union[rsa.RSAPublicKey, ec.EllipticCurvePublicKey], str, str]:
     """Load x509 certificate and determine signature algorithm."""
-    cert = x509.load_pem_x509_certificate(cert_file.read())
+    try:
+        cert = x509.load_pem_x509_certificate(cert_file.read())
+    except ValueError as e:
+        raise SystemExit(f'Unable to load x509 certificate, PEM format is required: {e}')
     
     public_key = cert.public_key()
     if isinstance(public_key, rsa.RSAPublicKey):
@@ -123,13 +147,44 @@ def load_certificate(cert_file) -> Tuple[x509.Certificate, Union[rsa.RSAPublicKe
     return cert, public_key, sign_algorithm, sign_method
 
 
-def load_private_key(key_file, password: Optional[str], sign_method: str) -> Union[rsa.RSAPrivateKey, ec.EllipticCurvePrivateKey]:
+def can_prompt() -> bool:
+    """Return True if a person is at a terminal to type a password."""
+    if sys.stdin is None or not sys.stdin.isatty():
+        return False
+    if sys.platform == 'win32':
+        # NUL also reports as a tty on Windows, only a real console has a console mode
+        import ctypes
+        import msvcrt
+        mode = ctypes.c_uint32()
+        handle = msvcrt.get_osfhandle(sys.stdin.fileno())
+        return bool(ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(mode)))
+    return True
+
+
+def get_key_password(key_name: str) -> bytes:
+    """Get the password for an encrypted private key from the environment, or prompt for it."""
+    password = os.environ.get(KEY_PASSWORD_ENV)
+    if not password:
+        if not can_prompt():
+            raise SystemExit(f'Private key is encrypted. Run interactively to be prompted for the password, '
+                             f'or set the {KEY_PASSWORD_ENV} environment variable.')
+        try:
+            password = getpass.getpass(f'Password for {key_name}: ')
+        except (KeyboardInterrupt, EOFError):
+            raise SystemExit('Cancelled.')
+    return password.encode('utf-8')
+
+
+def load_private_key(key_file, sign_method: str) -> Union[rsa.RSAPrivateKey, ec.EllipticCurvePrivateKey]:
     """Load and validate private key."""
-    password_bytes = password.encode('utf-8') if password else None
-    private_key = serialization.load_pem_private_key(
-        key_file.read(),
-        password=password_bytes,
-    )
+    key_data = key_file.read()
+    try:
+        try:
+            private_key = serialization.load_pem_private_key(key_data, password=None)
+        except TypeError:  # Key is encrypted, the password is only requested when needed
+            private_key = serialization.load_pem_private_key(key_data, password=get_key_password(key_file.name))
+    except (ValueError, UnsupportedAlgorithm) as e:  # Not PEM, incorrect password, or unsupported key type
+        raise SystemExit(f'Unable to load private key, PEM format and correct password are required: {e}')
     
     if isinstance(private_key, rsa.RSAPrivateKey) and sign_method == 'rsa':
         logging.info('RSA cryptosystem detected in private key.')
@@ -156,7 +211,7 @@ def apply_enveloped_transform(tree: _ElementTree, signature: _Element) -> _Eleme
     document = copy.deepcopy(tree)
     parent = document.getroot()
     sig_element = parent[sig_index]
-
+    
     # Enveloped signature transformation removes only the element, whitespace text around it is kept
     previous = sig_element.getprevious()
     if previous is not None:
@@ -164,14 +219,30 @@ def apply_enveloped_transform(tree: _ElementTree, signature: _Element) -> _Eleme
     else:
         parent.text = (parent.text or '') + (sig_element.tail or '')
     parent.remove(sig_element)
-
+    
     return document
 
 
-def build_reference(uri: str) -> _Element:
+def resolve_reference_path(uri: str, base_dir: str) -> str:
+    """Resolve an external QIF document URI to a local path, relative to the signed QIF document."""
+    parsed = urlparse(uri)
+    if parsed.scheme == 'file':
+        if parsed.netloc not in ('', 'localhost'):
+            raise SystemExit(f'External QIF document {uri} is on a remote host, only local files are supported.')
+        return url2pathname(parsed.path)
+    if len(parsed.scheme) == 1:  # Windows drive letter, an absolute path rather than a URI scheme
+        return uri
+    if parsed.scheme:
+        raise SystemExit(f'External QIF document {uri} is not a local file, only relative paths and file URIs are supported.')
+    
+    # Verifiers resolve relative URIs against the signed document's location, not the working directory
+    return os.path.join(base_dir, url2pathname(uri))
+
+
+def build_reference(uri: str, base_dir: str) -> _Element:
     """Create a Reference element for the given URI, digested now if external."""
     base_reference = etree.Element('Reference', attrib={"URI": uri})
-
+    
     # Add transforms
     br_transforms = etree.SubElement(base_reference, 'Transforms')
     if uri == "":  # Add enveloped signature transformation to QIF Document being signed
@@ -181,7 +252,7 @@ def build_reference(uri: str) -> _Element:
             attrib={"Algorithm": "http://www.w3.org/2000/09/xmldsig#enveloped-signature"}
         )
         # Applied by apply_enveloped_transform when the QIF Document is digested
-
+    
     # All references assumed to be XML, all get c14n transformation
     etree.SubElement(
         br_transforms,
@@ -195,17 +266,23 @@ def build_reference(uri: str) -> _Element:
         'DigestMethod',
         attrib={"Algorithm": "http://www.w3.org/2001/04/xmlenc#sha256"}
     )
-
+    
     br_digest_value = etree.SubElement(base_reference, 'DigestValue')
     if uri != "":  # External QIF Document
-        document = etree.parse(uri, parser=etree.XMLParser())
+        path = resolve_reference_path(uri, base_dir)
+        try:
+            document = etree.parse(path, parser=etree.XMLParser())
+        except etree.XMLSyntaxError as e:
+            raise SystemExit(f'Unable to parse XML from external QIF document {uri}: {e}')
+        except OSError as e:
+            raise SystemExit(f'Unable to read external QIF document {uri} ({path}): {e}')
         br_digest_value.text = digest_document(document, uri)
     # Loaded QIF Document is digested after the signature is placed and formatted
-
+    
     return base_reference
 
 
-def create_signature_element(tree: _ElementTree, sign_algorithm: str) -> Tuple[_Element, _Element]:
+def create_signature_element(tree: _ElementTree, sign_algorithm: str, base_dir: str) -> Tuple[_Element, _Element]:
     """Create the main Signature element with SignedInfo."""
     # Signature element contains all signature data per xmldsig
     signature = etree.Element('Signature', nsmap={None: "http://www.w3.org/2000/09/xmldsig#"})
@@ -229,7 +306,7 @@ def create_signature_element(tree: _ElementTree, sign_algorithm: str) -> Tuple[_
     )
     
     # Create digested reference for QIF Document
-    signed_info.append(build_reference(""))
+    signed_info.append(build_reference("", base_dir))
     
     # Loop through external documents, create digested reference if URI element exists
     ext_qif_docs = tree.iterfind(".//{http://qifstandards.org/xsd/qif3}ExternalQIFDocument")
@@ -237,7 +314,7 @@ def create_signature_element(tree: _ElementTree, sign_algorithm: str) -> Tuple[_
         qpid = ext_qif_doc.findtext(".//{http://qifstandards.org/xsd/qif3}QPId")
         uri = ext_qif_doc.findtext(".//{http://qifstandards.org/xsd/qif3}URI")
         if uri is not None:
-            signed_info.append(build_reference(uri))
+            signed_info.append(build_reference(uri, base_dir))
             logging.info(f'Added signature reference for external QIF document {qpid}')
         else:
             logging.warning(f'External QIF Document {qpid} has no URI, skipped')
@@ -258,10 +335,14 @@ def sign_document(signed_info: _Element, private_key: Union[rsa.RSAPrivateKey, e
         )
     else:  # assumed to be ecdsa, no padding argument
         ec_key = cast(ec.EllipticCurvePrivateKey, private_key)
-        sig_val = ec_key.sign(
+        der_sig = ec_key.sign(
             sign_info_c14n,
             ec.ECDSA(hashes.SHA256())
         )
+        # XML Signature requires the raw r || s form (RFC 4050), cryptography produces DER
+        r, s = decode_dss_signature(der_sig)
+        size = (ec_key.curve.key_size + 7) // 8
+        sig_val = r.to_bytes(size, 'big') + s.to_bytes(size, 'big')
     
     return sig_val
 
@@ -289,8 +370,14 @@ def verify_signature(public_key: Union[rsa.RSAPublicKey, ec.EllipticCurvePublicK
             )
         else:  # assumed to be ecdsa, no padding argument
             ec_pub_key = cast(ec.EllipticCurvePublicKey, public_key)
+            # Convert raw r || s back to DER for cryptography
+            size = len(sig_val) // 2
+            der_sig = encode_dss_signature(
+                int.from_bytes(sig_val[:size], 'big'),
+                int.from_bytes(sig_val[size:], 'big')
+            )
             ec_pub_key.verify(
-                sig_val,
+                der_sig,
                 sign_info_c14n,
                 ec.ECDSA(hashes.SHA256())
             )
@@ -309,8 +396,11 @@ def save_signed_document(tree: _ElementTree, original_filename: str, pretty_prin
     
     # Formatting has already been applied before signature computation
     # Just save the document as-is to preserve signature validity
-    with open(file_name, 'wb') as f:
-        tree.write(f, encoding='utf-8', xml_declaration=True)
+    try:
+        with open(file_name, 'wb') as f:
+            tree.write(f, encoding='utf-8', xml_declaration=True)
+    except OSError as e:
+        raise SystemExit(f'Unable to write signed QIF document {file_name}: {e}')
     
     format_type = "pretty-printed" if pretty_print else "formatted with newlines, no indentation"
     logging.info(f'Signed QIF document written to file {file_name} ({format_type})')
@@ -328,46 +418,43 @@ def main():
     
     # Load Certificate
     cert, public_key, sign_algorithm, sign_method = load_certificate(args.cert)
-
+    
     # Load Private Key
-    private_key = load_private_key(args.key, args.keypass, sign_method)
-
+    private_key = load_private_key(args.key, sign_method)
+    
     # Create Signature Element, SignatureValue is filled in once SignedInfo is signed
-    signature, signed_info = create_signature_element(tree, sign_algorithm)
+    base_dir = os.path.dirname(os.path.abspath(args.qifFile))
+    signature, signed_info = create_signature_element(tree, sign_algorithm, base_dir)
     signature_value = etree.SubElement(signature, 'SignatureValue')
     add_key_info(signature, cert)
-
+    
     # Add signature block to QIF Document tree
     qif_root = tree.getroot()
     qif_root.append(signature)
-
+    
     # Apply user's desired formatting to the whole document, signature block included, BEFORE
-    # computing digest and signature so the written whitespace matches what was signed
+    # computing digest and signature so the written whitespace matches what was signed.
+    # indent only replaces whitespace-only text between elements, element values are left untouched
     pretty_print_flag = getattr(args, 'pretty_print', False)
-    for elem in tree.iter():
-        if elem.text:
-            elem.text = elem.text.strip() or None
-        if elem.tail:
-            elem.tail = elem.tail.strip() or None
     if pretty_print_flag:
         etree.indent(tree, space="  ")
     else:
         # Newlines with zero indentation
         etree.indent(tree, space="")
-
+    
     # Digest the QIF Document now that its final layout is known
     doc_digest_value = signed_info.find('Reference[@URI=""]/DigestValue')
     doc_digest_value.text = digest_document(apply_enveloped_transform(tree, signature), "")
-
+    
     # Sign the document
     sig_val = sign_document(signed_info, private_key, sign_method)
     signature_value.text = base64.b64encode(sig_val)
-
+    
     # Verify signature
     verify_signature(public_key, sig_val, signed_info, sign_method)
-
+    
     # Save signed document
-    save_signed_document(tree, args.qifFile.name, getattr(args, 'pretty_print', False))
+    save_signed_document(tree, args.qifFile, getattr(args, 'pretty_print', False))
 
 
 if __name__ == "__main__":

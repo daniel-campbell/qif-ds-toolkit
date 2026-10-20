@@ -4,7 +4,7 @@ Toolkit for applying XML digital signatures to QIF (Quality Information Framewor
 
 ## Requirements
 
-- Python 3.7 or higher
+- Python 3.11 or higher
 - OpenSSL (for certificate generation)
 - xmlsec1 (optional, for signature verification)
 
@@ -37,6 +37,8 @@ Create a self-signed certificate for testing:
 openssl req -x509 -newkey rsa:2048 -noenc -keyout key.pem -out cert.cer
 ```
 
+`-noenc` requires OpenSSL 3.0 or later; older versions use `-nodes`.
+
 ### Sign a QIF Document
 
 Basic usage:
@@ -50,10 +52,18 @@ With verbose output:
 python signqif.py -v -key key.pem -cert cert.cer input.QIF
 ```
 
-With password-protected key:
-```bash
-python signqif.py -key key.pem -keypass yourpassword -cert cert.cer input.QIF
+### Password-Protected Keys
+
+If the private key is encrypted, the tool prompts for its password when it runs. The password is not shown as you type.
+
 ```
+$ python signqif.py -key key.pem -cert cert.cer input.QIF
+Password for key.pem:
+```
+
+For unattended signing, such as in a CI pipeline, set the `QIF_KEY_PASSWORD` environment variable instead, preferably from your CI system's secret store. If the key is encrypted, no terminal is available and the variable is not set, the tool exits with an error rather than waiting for input.
+
+Passwords cannot be given on the command line, where they would be visible to other users and saved in shell history.
 
 ### Verify Signature
 
@@ -62,6 +72,8 @@ Verify the signed document (requires xmlsec1):
 xmlsec1 --verify --trusted-pem cert.cer input-signed.QIF
 ```
 
+If the document references external QIF documents, run `xmlsec1` from the signed document's directory. The signer resolves relative external URIs against the signed document's location, as the XML Signature specification requires, but `xmlsec1` resolves them against the current working directory.
+
 ## Command Line Options
 
 | Option | Required | Description |
@@ -69,7 +81,6 @@ xmlsec1 --verify --trusted-pem cert.cer input-signed.QIF
 | `qifFile` | Yes | QIF file to be signed (positional argument) |
 | `-key KEY` | Yes | Private key file in PEM format |
 | `-cert CERT` | Yes | x509 certificate file in PEM format |
-| `-keypass KEYPASS` | No | Password for private key (if password-protected) |
 | `-v` | No | Enable verbose output for detailed logging |
 | `--pretty-print` | No | Format output XML with indentation for readability |
 | `-h, --help` | No | Show help message and exit |
@@ -79,11 +90,6 @@ xmlsec1 --verify --trusted-pem cert.cer input-signed.QIF
 **Basic signing:**
 ```bash
 python signqif.py -key private.pem -cert certificate.cer document.QIF
-```
-
-**With password-protected key:**
-```bash
-python signqif.py -key private.pem -keypass mypassword -cert certificate.cer document.QIF
 ```
 
 **With verbose logging:**
@@ -104,6 +110,8 @@ The tool creates a new QIF file with "-signed" appended to the original filename
 
 - **Default**: Output has newlines between elements but zero indentation (each element starts at column 0)
 - **With `--pretty-print`**: Output is formatted with consistent indentation (2 spaces) for improved readability
+
+Either way, only whitespace between elements is changed; element values are written exactly as they appear in the input.
 
 ## Features
 
