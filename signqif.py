@@ -19,6 +19,7 @@ Usage examples:
 
 import argparse
 import base64
+import copy
 import hashlib
 import logging
 from typing import Optional, Tuple, Union, cast
@@ -141,16 +142,36 @@ def load_private_key(key_file, password: Optional[str], sign_method: str) -> Uni
     return private_key
 
 
-def build_reference(uri: str, tree: _ElementTree) -> _Element:
-    """Create a completed Reference element for the given URI."""
+def digest_document(document: _ElementTree, uri: str) -> str:
+    """Return the base64 SHA256 digest of the c14n form of a document."""
+    doc_string = etree.tostring(document, method="c14n", with_comments=False)
+    doc_digest = base64.b64encode(hashlib.sha256(doc_string).digest()).decode('ascii')
+    logging.info(f"{uri} digested to {doc_digest}")
+    return doc_digest
+
+
+def apply_enveloped_transform(tree: _ElementTree, signature: _Element) -> _ElementTree:
+    """Return a copy of the QIF Document with the Signature element removed."""
+    sig_index = tree.getroot().index(signature)
+    document = copy.deepcopy(tree)
+    parent = document.getroot()
+    sig_element = parent[sig_index]
+
+    # Enveloped signature transformation removes only the element, whitespace text around it is kept
+    previous = sig_element.getprevious()
+    if previous is not None:
+        previous.tail = (previous.tail or '') + (sig_element.tail or '')
+    else:
+        parent.text = (parent.text or '') + (sig_element.tail or '')
+    parent.remove(sig_element)
+
+    return document
+
+
+def build_reference(uri: str) -> _Element:
+    """Create a Reference element for the given URI, digested now if external."""
     base_reference = etree.Element('Reference', attrib={"URI": uri})
-    
-    # Determine document source
-    if uri == "":  # Loaded QIF Document
-        document = tree
-    else:  # External QIF Document
-        document = etree.parse(uri, parser=etree.XMLParser())
-    
+
     # Add transforms
     br_transforms = etree.SubElement(base_reference, 'Transforms')
     if uri == "":  # Add enveloped signature transformation to QIF Document being signed
@@ -159,8 +180,8 @@ def build_reference(uri: str, tree: _ElementTree) -> _Element:
             'Transform',
             attrib={"Algorithm": "http://www.w3.org/2000/09/xmldsig#enveloped-signature"}
         )
-        # No action needed, signature element has already been removed from document
-    
+        # Applied by apply_enveloped_transform when the QIF Document is digested
+
     # All references assumed to be XML, all get c14n transformation
     etree.SubElement(
         br_transforms,
@@ -168,20 +189,19 @@ def build_reference(uri: str, tree: _ElementTree) -> _Element:
         attrib={"Algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"}
     )
     
-    doc_string = etree.tostring(document, method="c14n", with_comments=False)
-    
     # Use SHA256 as the digest method, SHA1 is not recommended
     etree.SubElement(
         base_reference,
         'DigestMethod',
         attrib={"Algorithm": "http://www.w3.org/2001/04/xmlenc#sha256"}
     )
-    
-    doc_digest = hashlib.sha256(doc_string).digest()
+
     br_digest_value = etree.SubElement(base_reference, 'DigestValue')
-    br_digest_value.text = base64.b64encode(doc_digest)
-    logging.info(f"{uri} digested to {base64.b64encode(doc_digest).decode('ascii')}")
-    
+    if uri != "":  # External QIF Document
+        document = etree.parse(uri, parser=etree.XMLParser())
+        br_digest_value.text = digest_document(document, uri)
+    # Loaded QIF Document is digested after the signature is placed and formatted
+
     return base_reference
 
 
@@ -209,7 +229,7 @@ def create_signature_element(tree: _ElementTree, sign_algorithm: str) -> Tuple[_
     )
     
     # Create digested reference for QIF Document
-    signed_info.append(build_reference("", tree))
+    signed_info.append(build_reference(""))
     
     # Loop through external documents, create digested reference if URI element exists
     ext_qif_docs = tree.iterfind(".//{http://qifstandards.org/xsd/qif3}ExternalQIFDocument")
@@ -217,7 +237,7 @@ def create_signature_element(tree: _ElementTree, sign_algorithm: str) -> Tuple[_
         qpid = ext_qif_doc.findtext(".//{http://qifstandards.org/xsd/qif3}QPId")
         uri = ext_qif_doc.findtext(".//{http://qifstandards.org/xsd/qif3}URI")
         if uri is not None:
-            signed_info.append(build_reference(uri, tree))
+            signed_info.append(build_reference(uri))
             logging.info(f'Added signature reference for external QIF document {qpid}')
         else:
             logging.warning(f'External QIF Document {qpid} has no URI, skipped')
@@ -244,12 +264,6 @@ def sign_document(signed_info: _Element, private_key: Union[rsa.RSAPrivateKey, e
         )
     
     return sig_val
-
-
-def add_signature_value(signature: _Element, sig_val: bytes) -> None:
-    """Add SignatureValue to the signature element."""
-    signature_value = etree.SubElement(signature, 'SignatureValue')
-    signature_value.text = base64.b64encode(sig_val)
 
 
 def add_key_info(signature: _Element, cert: x509.Certificate) -> None:
@@ -312,48 +326,46 @@ def main():
     # Load QIF Document
     tree = load_qif_document(args.qifFile)
     
-    # Apply user's desired formatting BEFORE computing signature to ensure verification works
-    pretty_print_flag = getattr(args, 'pretty_print', False)
-    if pretty_print_flag:
-        # Strip all whitespace and apply pretty printing
-        for elem in tree.iter():
-            if elem.text:
-                elem.text = elem.text.strip() or None
-            if elem.tail:
-                elem.tail = elem.tail.strip() or None
-        etree.indent(tree, space="  ")
-    else:
-        # Strip whitespace and apply newlines with zero indentation
-        for elem in tree.iter():
-            if elem.text:
-                elem.text = elem.text.strip() or None
-            if elem.tail:
-                elem.tail = elem.tail.strip() or None
-        etree.indent(tree, space="")
-    
     # Load Certificate
     cert, public_key, sign_algorithm, sign_method = load_certificate(args.cert)
-    
+
     # Load Private Key
     private_key = load_private_key(args.key, args.keypass, sign_method)
-    
-    # Create Signature Element
+
+    # Create Signature Element, SignatureValue is filled in once SignedInfo is signed
     signature, signed_info = create_signature_element(tree, sign_algorithm)
-    
-    # Sign the document
-    sig_val = sign_document(signed_info, private_key, sign_method)
-    
-    # Add signature value and key info
-    add_signature_value(signature, sig_val)
+    signature_value = etree.SubElement(signature, 'SignatureValue')
     add_key_info(signature, cert)
-    
-    # Verify signature
-    verify_signature(public_key, sig_val, signed_info, sign_method)
-    
+
     # Add signature block to QIF Document tree
     qif_root = tree.getroot()
     qif_root.append(signature)
-    
+
+    # Apply user's desired formatting to the whole document, signature block included, BEFORE
+    # computing digest and signature so the written whitespace matches what was signed
+    pretty_print_flag = getattr(args, 'pretty_print', False)
+    for elem in tree.iter():
+        if elem.text:
+            elem.text = elem.text.strip() or None
+        if elem.tail:
+            elem.tail = elem.tail.strip() or None
+    if pretty_print_flag:
+        etree.indent(tree, space="  ")
+    else:
+        # Newlines with zero indentation
+        etree.indent(tree, space="")
+
+    # Digest the QIF Document now that its final layout is known
+    doc_digest_value = signed_info.find('Reference[@URI=""]/DigestValue')
+    doc_digest_value.text = digest_document(apply_enveloped_transform(tree, signature), "")
+
+    # Sign the document
+    sig_val = sign_document(signed_info, private_key, sign_method)
+    signature_value.text = base64.b64encode(sig_val)
+
+    # Verify signature
+    verify_signature(public_key, sig_val, signed_info, sign_method)
+
     # Save signed document
     save_signed_document(tree, args.qifFile.name, getattr(args, 'pretty_print', False))
 
