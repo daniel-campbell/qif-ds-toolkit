@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """QIF Digital Signature Tool
 
-This program creates an XML digital signature for input QIF Document using
-input file and external QIF documents as references.
+This program creates an XML digital signature for each input QIF Document using
+the input file and external QIF documents as references.
 
 External libraries lxml and cryptography are required.
 
 Usage examples:
     # Create a self-signed certificate for testing
     openssl req -x509 -newkey rsa:2048 -noenc -keyout key.pem -out cert.cer
-    
+
     # Sign a QIF document
     python signqif.py -v -key 'key.pem' -cert 'cert.cer' 'Exploded_Results1.QIF'
-    
+
+    # Sign every document of a batch
+    python signqif.py -key key.pem -cert cert.cer plans/*.qif
+
     # Validate the signature
     xmlsec1 --verify --trusted-pem cert.cer Exploded_Results1-signed.QIF
 """
@@ -25,7 +28,7 @@ import hashlib
 import logging
 import os
 import sys
-from typing import Optional, Tuple, Union, cast
+from typing import List, Optional, Tuple, Union, cast
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
@@ -44,6 +47,12 @@ KEY_PASSWORD_ENV = 'QIF_KEY_PASSWORD'
 # Password prompts allowed before giving up
 PASSWORD_ATTEMPTS = 3
 
+# Signature algorithms per cryptosystem, SHA256 is the minimum recommended by the XML Signature standard
+SIGN_ALGORITHMS = {
+    'rsa': 'http://www.w3.org/2001/04/xmldsig-more#rsa-sha256',
+    'ecdsa': 'http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256',
+}
+
 
 def setup_logging(verbose: bool) -> None:
     """Configure logging based on verbosity level."""
@@ -55,12 +64,14 @@ def setup_logging(verbose: bool) -> None:
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description='Program creates an XML digital signature for input QIF '
-                   'Document using input file and external QIF documents as references.'
+        description='Program creates an XML digital signature for each input QIF '
+                   'Document using the input file and external QIF documents as references.'
     )
     parser.add_argument(
-        'qifFile',
-        help='QIF file to be signed'
+        'qifFiles',
+        nargs='+',
+        metavar='qifFile',
+        help='QIF file(s) to be signed'
     )
     parser.add_argument(
         '-key', 
@@ -74,9 +85,15 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         '-cert', 
-        help='x509 cert in PEM format', 
+        help='x509 cert in PEM format, a file holding several certificates '
+             'such as a chain is accepted as long as one matches the private key', 
         type=argparse.FileType('rb'), 
         required=True
+    )
+    parser.add_argument(
+        '-o', '--output',
+        help='Write the signed document to this path instead of adding -signed to the '
+             'input name. Only valid with a single input file.'
     )
     parser.add_argument(
         '-v', 
@@ -93,6 +110,9 @@ def parse_arguments() -> argparse.Namespace:
         parser.error(f'-keypass has been removed because passwords on the command line are visible to other '
                      f'users and saved in shell history. You will be prompted for the password, or set the '
                      f'{KEY_PASSWORD_ENV} environment variable for unattended signing.')
+    if args.output and len(args.qifFiles) > 1:
+        parser.error('-o/--output can only be used with a single input file, '
+                     'since every input would otherwise write to the same path.')
     return args
 
 
@@ -128,27 +148,48 @@ def load_qif_document(qif_path: str) -> _ElementTree:
     return tree
 
 
-def load_certificate(cert_file) -> Tuple[x509.Certificate, Union[rsa.RSAPublicKey, ec.EllipticCurvePublicKey], str, str]:
-    """Load x509 certificate and determine signature algorithm."""
+def load_certificates(cert_file) -> List[x509.Certificate]:
+    """Load every certificate of a PEM file, such as a certificate chain."""
     try:
-        cert = x509.load_pem_x509_certificate(cert_file.read())
+        certificates = x509.load_pem_x509_certificates(cert_file.read())
     except ValueError as e:
         raise SystemExit(f'Unable to load x509 certificate, PEM format is required: {e}')
     
-    public_key = cert.public_key()
-    if isinstance(public_key, rsa.RSAPublicKey):
-        sign_algorithm = 'http://www.w3.org/2001/04/xmldsig-more#rsa-sha256'
-        sign_method = 'rsa'
-        logging.info('RSA cryptosystem detected in certification.')
-    elif isinstance(public_key, ec.EllipticCurvePublicKey):
-        sign_algorithm = 'http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256'
-        sign_method = 'ecdsa'
-        logging.info('ECDSA cryptosystem detected in certification.')
-    else:
-        raise SystemExit('Certificate does not contain a recognized cryptosystem, '
-                        'allowable types are RSA and ECDSA.')
+    if not certificates:
+        raise SystemExit(f'No certificate found in {cert_file.name}, PEM format is required.')
+    logging.info(f'Loaded {len(certificates)} certificate(s) from {cert_file.name}.')
+    return certificates
+
+
+def select_certificate(certificates: List[x509.Certificate], private_key: PrivateKeyTypes,
+                       cert_name: str, key_name: str) -> Tuple[x509.Certificate, str, str]:
+    """Return the certificate matching the private key, with its signature algorithm and cryptosystem."""
+    public_key = private_key.public_key()
+    for cert in certificates:
+        cert_key = cert.public_key()
+        # The public key of the certificate must be the one belonging to the private key
+        if type(cert_key) is type(public_key) and cert_key.public_numbers() == public_key.public_numbers():
+            sign_method = 'rsa' if isinstance(cert_key, rsa.RSAPublicKey) else 'ecdsa'
+            logging.info(f'{sign_method.upper()} cryptosystem detected in certificate and private key.')
+            return cert, SIGN_ALGORITHMS[sign_method], sign_method
     
-    return cert, public_key, sign_algorithm, sign_method
+    raise SystemExit(f'None of the certificates in {cert_name} matches the private key {key_name}.')
+
+
+def certificate_fingerprint(cert: x509.Certificate) -> str:
+    """Return the SHA256 fingerprint of a certificate, colon separated."""
+    return cert.fingerprint(hashes.SHA256()).hex(':').upper()
+
+
+def certificate_validity_note(cert: x509.Certificate) -> Optional[str]:
+    """Return a warning when the certificate is outside its validity period today, or None."""
+    from datetime import datetime, timezone
+    
+    now = datetime.now(timezone.utc)
+    if cert.not_valid_before_utc <= now <= cert.not_valid_after_utc:
+        return None
+    return ('Note: the certificate is outside its validity period today. The document does not record '
+            'when it was signed, so whether this matters depends on your policy.')
 
 
 def can_prompt() -> bool:
@@ -204,7 +245,7 @@ def load_encrypted_private_key(key_data: bytes, key_name: str) -> PrivateKeyType
     raise SystemExit(f'Incorrect password for {key_name}.')
 
 
-def load_private_key(key_file, sign_method: str) -> Union[rsa.RSAPrivateKey, ec.EllipticCurvePrivateKey]:
+def load_private_key(key_file) -> PrivateKeyTypes:
     """Load and validate private key."""
     key_data = key_file.read()
     try:
@@ -214,13 +255,9 @@ def load_private_key(key_file, sign_method: str) -> Union[rsa.RSAPrivateKey, ec.
     except (ValueError, UnsupportedAlgorithm) as e:  # Not PEM, or unsupported key type
         raise SystemExit(f'Unable to load private key, PEM format is required: {e}')
     
-    if isinstance(private_key, rsa.RSAPrivateKey) and sign_method == 'rsa':
-        logging.info('RSA cryptosystem detected in private key.')
-    elif isinstance(private_key, ec.EllipticCurvePrivateKey) and sign_method == 'ecdsa':
-        logging.info('ECDSA cryptosystem detected in private key.')
-    else:
-        raise SystemExit('Private key does not contain a recognized cryptosystem or '
-                        'does not match certificate cryptosystem, allowable types are RSA and ECDSA.')
+    if not isinstance(private_key, (rsa.RSAPrivateKey, ec.EllipticCurvePrivateKey)):
+        raise SystemExit('Private key does not contain a recognized cryptosystem, '
+                         'allowable types are RSA and ECDSA.')
     
     return private_key
 
@@ -337,15 +374,21 @@ def create_signature_element(tree: _ElementTree, sign_algorithm: str, base_dir: 
     signed_info.append(build_reference("", base_dir))
     
     # Loop through external documents, create digested reference if URI element exists
+    external_references = set()
     ext_qif_docs = tree.iterfind(".//{http://qifstandards.org/xsd/qif3}ExternalQIFDocument")
     for ext_qif_doc in ext_qif_docs:
         qpid = ext_qif_doc.findtext(".//{http://qifstandards.org/xsd/qif3}QPId")
         uri = ext_qif_doc.findtext(".//{http://qifstandards.org/xsd/qif3}URI")
-        if uri is not None:
-            signed_info.append(build_reference(uri, base_dir))
-            logging.info(f'Added signature reference for external QIF document {qpid}')
-        else:
+        if uri is None:
             logging.warning(f'External QIF Document {qpid} has no URI, skipped')
+            continue
+        # A document listed twice would otherwise be referenced, and digested, twice
+        if uri in external_references:
+            logging.warning(f'External QIF Document {uri} is referenced more than once, skipped')
+            continue
+        external_references.add(uri)
+        signed_info.append(build_reference(uri, base_dir))
+        logging.info(f'Added signature reference for external QIF document {qpid}')
     
     return signature, signed_info
 
@@ -417,13 +460,18 @@ def verify_signature(public_key: Union[rsa.RSAPublicKey, ec.EllipticCurvePublicK
                         'possible mismatch between private key and certificate')
 
 
-def save_signed_document(tree: _ElementTree, original_filename: str, pretty_print: bool = False) -> str:
-    """Save the signed QIF document with '-signed' appended to filename."""
-    type_loc = original_filename.rfind('.')
-    if type_loc == -1:
-        type_loc = len(original_filename)
-    
-    file_name = original_filename[:type_loc] + '-signed' + original_filename[type_loc:]
+def signed_document_path(original_filename: str) -> str:
+    """Return the input path with -signed added to the file name, keeping its extension."""
+    directory, base_name = os.path.split(original_filename)
+    stem, extension = os.path.splitext(base_name)
+    # Splitting the name rather than the path keeps dots in directory names out of the way
+    return os.path.join(directory, f'{stem}-signed{extension}')
+
+
+def save_signed_document(tree: _ElementTree, original_filename: str, pretty_print: bool = False,
+                         output_path: Optional[str] = None) -> str:
+    """Save the signed QIF document, to output_path or with '-signed' appended to the input name."""
+    file_name = output_path or signed_document_path(original_filename)
     
     # Formatting has already been applied before signature computation
     # Just save the document as-is to preserve signature validity
@@ -439,22 +487,13 @@ def save_signed_document(tree: _ElementTree, original_filename: str, pretty_prin
     return file_name
 
 
-def main():
-    """Main execution function."""
-    args = parse_arguments()
-    setup_logging(args.v)
-    
-    # Load QIF Document
-    tree = load_qif_document(args.qifFile)
-    
-    # Load Certificate
-    cert, public_key, sign_algorithm, sign_method = load_certificate(args.cert)
-    
-    # Load Private Key
-    private_key = load_private_key(args.key, sign_method)
+def sign_file(qif_path: str, private_key: PrivateKeyTypes, cert: x509.Certificate, sign_algorithm: str,
+              sign_method: str, pretty_print: bool = False, output_path: Optional[str] = None) -> str:
+    """Sign one QIF document and return the path of the signed document."""
+    tree = load_qif_document(qif_path)
     
     # Create Signature Element, SignatureValue is filled in once SignedInfo is signed
-    base_dir = os.path.dirname(os.path.abspath(args.qifFile))
+    base_dir = os.path.dirname(os.path.abspath(qif_path))
     signature, signed_info = create_signature_element(tree, sign_algorithm, base_dir)
     signature_value = etree.SubElement(signature, 'SignatureValue')
     add_key_info(signature, cert)
@@ -466,8 +505,7 @@ def main():
     # Apply user's desired formatting to the whole document, signature block included, BEFORE
     # computing digest and signature so the written whitespace matches what was signed.
     # indent only replaces whitespace-only text between elements, element values are left untouched
-    pretty_print_flag = getattr(args, 'pretty_print', False)
-    if pretty_print_flag:
+    if pretty_print:
         etree.indent(tree, space="  ")
     else:
         # Newlines with zero indentation
@@ -482,11 +520,48 @@ def main():
     signature_value.text = base64.b64encode(sig_val)
     
     # Verify signature
-    verify_signature(public_key, sig_val, signed_info, sign_method)
+    verify_signature(cert.public_key(), sig_val, signed_info, sign_method)
     
     # Save signed document
-    save_signed_document(tree, args.qifFile, getattr(args, 'pretty_print', False))
+    return save_signed_document(tree, qif_path, pretty_print, output_path)
 
 
-if __name__ == "__main__":
-    main()
+def main() -> int:
+    """Main execution function."""
+    args = parse_arguments()
+    setup_logging(args.v)
+    
+    certificates = load_certificates(args.cert)
+    private_key = load_private_key(args.key)
+    cert, sign_algorithm, sign_method = select_certificate(
+        certificates, private_key, args.cert.name, args.key.name)
+    validity_note = certificate_validity_note(cert)
+    
+    failures = []
+    for qif_path in args.qifFiles:
+        try:
+            signed_path = sign_file(qif_path, private_key, cert, sign_algorithm, sign_method,
+                                    args.pretty_print, args.output)
+        except SystemExit as e:
+            message = e.code if isinstance(e.code, str) else 'Unable to sign the document.'
+            failures.append((qif_path, message))
+            # With a batch the message belongs to one file, name it to keep the run readable
+            label = '' if len(args.qifFiles) == 1 else f'{qif_path}: '
+            print(label + message, file=sys.stderr)
+            continue
+        
+        print(f'Signed {qif_path} -> {signed_path}')
+        print(f'Signer certificate: {cert.subject.rfc4514_string()}, SHA256 {certificate_fingerprint(cert)}')
+        if validity_note:
+            print(f'  {validity_note}')
+    
+    if failures:
+        print(f'{len(failures)} of {len(args.qifFiles)} document(s) could not be signed.', file=sys.stderr)
+        return 1
+    if len(args.qifFiles) > 1:
+        print(f'Signed {len(args.qifFiles)} documents.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

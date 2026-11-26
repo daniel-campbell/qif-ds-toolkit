@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """QIF Digital Signature Verification Tool
 
-This program verifies the XML digital signature of a QIF Document, including
-the digests of any external QIF documents it references.
+This program verifies the XML digital signature of each input QIF Document,
+including the digests of any external QIF documents it references.
 
 External libraries lxml and cryptography are required.
 
@@ -12,6 +12,9 @@ Usage examples:
     
     # Also require that it was signed with a certificate you trust
     python verifyqif.py -cert trusted.cer Exploded_Results1-signed.QIF
+    
+    # Check a batch and print a report a script can read
+    python verifyqif.py --json signed/*.qif
 """
 
 import argparse
@@ -19,10 +22,11 @@ import base64
 import copy
 import hashlib
 import io
+import json
 import logging
 import os
-from datetime import datetime, timezone
-from typing import Optional, Tuple
+import sys
+from typing import Any, Dict, List, Optional, Tuple
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
@@ -31,7 +35,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding
 from lxml import etree
 from lxml.etree import _Element, _ElementTree
 
-from signqif import apply_enveloped_transform, ecdsa_raw_to_der, resolve_reference_path, setup_logging
+from signqif import (apply_enveloped_transform, certificate_fingerprint, certificate_validity_note,
+                     ecdsa_raw_to_der, resolve_reference_path, setup_logging)
 
 DS = '{http://www.w3.org/2000/09/xmldsig#}'
 EXC_C14N = '{http://www.w3.org/2001/10/xml-exc-c14n#}'
@@ -71,18 +76,26 @@ class ReferenceProblem(Exception):
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description='Program verifies the XML digital signature of a QIF Document, '
+        description='Program verifies the XML digital signature of each input QIF Document, '
                    'including external QIF documents it references.'
     )
     parser.add_argument(
-        'qifFile',
-        help='Signed QIF file to be verified'
+        'qifFiles',
+        nargs='+',
+        metavar='qifFile',
+        help='Signed QIF file(s) to be verified'
     )
     parser.add_argument(
         '-cert',
-        help='x509 cert in PEM format that the document must be signed with. '
-             'Without it, the certificate embedded in the document is used.',
+        help='x509 cert in PEM format that the documents must be signed with. A file holding '
+             'several certificates, such as a chain, is accepted. Without it, the certificate '
+             'embedded in each document is used.',
         type=argparse.FileType('rb')
+    )
+    parser.add_argument(
+        '--json',
+        help='Print a machine-readable JSON report instead of the text summary',
+        action='store_true'
     )
     parser.add_argument(
         '-v',
@@ -90,6 +103,18 @@ def parse_arguments() -> argparse.Namespace:
         action='store_true'
     )
     return parser.parse_args()
+
+
+def load_trusted_certificates(cert_file) -> List[x509.Certificate]:
+    """Load every certificate of the file given by -cert, so a chain can be given as one file."""
+    try:
+        certificates = x509.load_pem_x509_certificates(cert_file.read())
+    except ValueError as e:
+        raise SystemExit(f'Unable to load x509 certificate, PEM format is required: {e}')
+    
+    if not certificates:
+        raise SystemExit(f'No certificate found in {cert_file.name}, PEM format is required.')
+    return certificates
 
 
 def load_signed_document(qif_path: str) -> Tuple[_ElementTree, _Element]:
@@ -212,7 +237,7 @@ def check_reference(reference: _Element, tree: _ElementTree, signature: _Element
     return None
 
 
-def load_embedded_certificates(signature: _Element) -> list:
+def load_embedded_certificates(signature: _Element) -> List[x509.Certificate]:
     """Load the x509 certificates embedded in the Signature KeyInfo."""
     certs = []
     for cert_text in signature.iterfind(f'{DS}KeyInfo/{DS}X509Data/{DS}X509Certificate'):
@@ -239,40 +264,38 @@ def signature_matches(cert: x509.Certificate, signed_bytes: bytes, sig_val: byte
     return True
 
 
-def describe_certificate(cert: x509.Certificate) -> None:
-    """Print who a certificate identifies and whether it is currently within its validity period."""
-    fingerprint = cert.fingerprint(hashes.SHA256()).hex(':').upper()
-    print(f'  Subject:     {cert.subject.rfc4514_string()}')
-    print(f'  Issuer:      {cert.issuer.rfc4514_string()}')
-    print(f'  Valid:       {cert.not_valid_before_utc:%Y-%m-%d} to {cert.not_valid_after_utc:%Y-%m-%d}')
-    print(f'  Fingerprint: SHA256 {fingerprint}')
-    
-    now = datetime.now(timezone.utc)
-    if not cert.not_valid_before_utc <= now <= cert.not_valid_after_utc:
-        print('  Note: the certificate is outside its validity period today. The document does not record '
-              'when it was signed, so whether this matters depends on your policy.')
+def certificate_details(cert: x509.Certificate, source: str) -> Dict[str, Any]:
+    """Describe who a certificate identifies and whether it is currently within its validity period."""
+    return {
+        'subject': cert.subject.rfc4514_string(),
+        'issuer': cert.issuer.rfc4514_string(),
+        'not_valid_before': f'{cert.not_valid_before_utc:%Y-%m-%d}',
+        'not_valid_after': f'{cert.not_valid_after_utc:%Y-%m-%d}',
+        'within_validity_period': certificate_validity_note(cert) is None,
+        'sha256_fingerprint': certificate_fingerprint(cert),
+        'source': source,
+    }
 
 
-def main():
-    """Main execution function."""
-    args = parse_arguments()
-    setup_logging(args.v)
-    
-    tree, signature = load_signed_document(args.qifFile)
-    base_dir = os.path.dirname(os.path.abspath(args.qifFile))
-    valid = True
+def check_document(qif_path: str, trusted_certificates: Optional[List[x509.Certificate]]) -> Dict[str, Any]:
+    """Verify one signed document and return what was found, without printing anything."""
+    tree, signature = load_signed_document(qif_path)
+    base_dir = os.path.dirname(os.path.abspath(qif_path))
+    report: Dict[str, Any] = {
+        'file': qif_path,
+        'references': [],
+        'signature': {'status': 'not checked', 'reason': None},
+        'certificate': None,
+        'result': 'invalid',
+    }
+    references = report['references']
     
     # Check the digest of every referenced document
     signed_info = find_required(signature, f'{DS}SignedInfo')
     for reference in signed_info.iterfind(f'{DS}Reference'):
         uri = reference.get('URI')
-        label = 'this document' if uri == '' else uri
         problem = check_reference(reference, tree, signature, base_dir)
-        if problem is None:
-            print(f'Reference {label}: OK')
-        else:
-            print(f'Reference {label}: FAILED, {problem}')
-            valid = False
+        references.append({'uri': uri, 'status': 'ok' if problem is None else 'failed', 'problem': problem})
     
     # Check the signature over SignedInfo
     signature_method = find_required(signed_info, f'{DS}SignatureMethod').get('Algorithm')
@@ -284,11 +307,8 @@ def main():
         raise SystemExit(f'Unable to check signature, {e}.')
     sig_val = base64.b64decode(find_required(signature, f'{DS}SignatureValue').text or '')
     
-    if args.cert:
-        try:
-            candidates = [x509.load_pem_x509_certificate(args.cert.read())]
-        except ValueError as e:
-            raise SystemExit(f'Unable to load x509 certificate, PEM format is required: {e}')
+    if trusted_certificates:
+        candidates = trusted_certificates
     else:
         candidates = load_embedded_certificates(signature)
         if not candidates:
@@ -296,22 +316,109 @@ def main():
     
     signer_cert = next((c for c in candidates if signature_matches(c, signed_bytes, sig_val, signature_method)), None)
     if signer_cert is None:
-        source = 'the certificate given by -cert' if args.cert else 'the certificate embedded in the file'
-        print(f'Signature: FAILED, not signed with {source}')
-        valid = False
+        source = 'the certificate given by -cert' if trusted_certificates else 'the certificate embedded in the file'
+        report['signature'] = {'status': 'failed', 'reason': f'not signed with {source}'}
     else:
+        report['signature'] = {'status': 'ok', 'reason': None}
+        report['certificate'] = certificate_details(
+            signer_cert, 'argument' if trusted_certificates else 'embedded')
+    
+    references_ok = all(reference['status'] == 'ok' for reference in references)
+    report['result'] = 'valid' if references_ok and report['signature']['status'] == 'ok' else 'invalid'
+    return report
+
+
+def error_report(qif_path: str, message: str) -> Dict[str, Any]:
+    """Report a document that could not be checked at all."""
+    return {
+        'file': qif_path,
+        'error': message,
+        'references': [],
+        'signature': {'status': 'not checked', 'reason': None},
+        'certificate': None,
+        'result': 'invalid',
+    }
+
+
+def print_certificate(details: Dict[str, Any]) -> None:
+    """Print the certificate block of a text report."""
+    print(f'  Subject:     {details["subject"]}')
+    print(f'  Issuer:      {details["issuer"]}')
+    print(f'  Valid:       {details["not_valid_before"]} to {details["not_valid_after"]}')
+    print(f'  Fingerprint: SHA256 {details["sha256_fingerprint"]}')
+    if not details['within_validity_period']:
+        print('  Note: the certificate is outside its validity period today. The document does not record '
+              'when it was signed, so whether this matters depends on your policy.')
+    if details['source'] == 'argument':
+        print('  Checked against the certificate given by -cert.')
+    else:
+        print('  Checked against the certificate embedded in the file. This shows the document has not '
+              'changed since it was signed, not who signed it. Use -cert to require a certificate you trust.')
+
+
+def print_report(report: Dict[str, Any], label_file: bool = False) -> None:
+    """Print one document's verification result in the text format."""
+    if 'error' in report:
+        label = f'{report["file"]}: ' if label_file else ''
+        print(f'{label}{report["error"]}', file=sys.stderr)
+        return
+    
+    for reference in report['references']:
+        label = 'this document' if reference['uri'] == '' else reference['uri']
+        if reference['status'] == 'ok':
+            print(f'Reference {label}: OK')
+        else:
+            print(f'Reference {label}: FAILED, {reference["problem"]}')
+    
+    if report['signature']['status'] == 'ok':
         print('Signature: OK')
         print('Signed with certificate:')
-        describe_certificate(signer_cert)
-        if args.cert:
-            print('  Checked against the certificate given by -cert.')
-        else:
-            print('  Checked against the certificate embedded in the file. This shows the document has not '
-                  'changed since it was signed, not who signed it. Use -cert to require a certificate you trust.')
+        print_certificate(report['certificate'])
+    else:
+        print(f'Signature: FAILED, {report["signature"]["reason"]}')
+    print('Result: VALID' if report['result'] == 'valid' else 'Result: INVALID')
+
+
+def main() -> int:
+    """Main execution function."""
+    args = parse_arguments()
+    setup_logging(args.v)
     
-    print('Result: VALID' if valid else 'Result: INVALID')
-    raise SystemExit(0 if valid else 1)
+    trusted_certificates = load_trusted_certificates(args.cert) if args.cert else None
+    reports = []
+    for qif_path in args.qifFiles:
+        try:
+            reports.append(check_document(qif_path, trusted_certificates))
+        except SystemExit as e:
+            # One unusable document must not stop a batch, it is reported as invalid
+            message = e.code if isinstance(e.code, str) else 'Unable to verify the document.'
+            reports.append(error_report(qif_path, message))
+    
+    valid_count = sum(1 for report in reports if report['result'] == 'valid')
+    invalid_count = len(reports) - valid_count
+    batch = len(reports) > 1
+    
+    if args.json:
+        print(json.dumps({
+            'files': reports,
+            'documents': len(reports),
+            'valid': valid_count,
+            'invalid': invalid_count,
+            'result': 'valid' if invalid_count == 0 else 'invalid',
+        }, indent=2))
+    else:
+        for index, report in enumerate(reports):
+            if batch:
+                if index:
+                    print()
+                print(f'== {report["file"]} ==')
+            print_report(report, label_file=batch)
+        if batch:
+            print()
+            print(f'{valid_count} of {len(reports)} documents valid.')
+    
+    return 0 if invalid_count == 0 else 1
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())
